@@ -3,7 +3,6 @@
 import json, os, time, gc, warnings, logging
 import pandas as pd
 import numpy as np
-import torch
 try:
     import timesfm
     _TIMESFM_AVAILABLE = True
@@ -11,11 +10,9 @@ except ModuleNotFoundError:
     _TIMESFM_AVAILABLE = False
     print("WARNING: timesfm not installed — forecast signal disabled")
 from datetime import datetime
-import outlines
-from outlines import Generator, from_transformers
 from pydantic import BaseModel
 from typing import Literal, List, Dict, Optional
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, logging as hf_logging
+from huggingface_hub import InferenceClient
 from dotenv import load_dotenv
 
 # API imports
@@ -24,7 +21,6 @@ from fastapi import FastAPI, Request
 os.environ["HF_HOME"]               = "./.cache"
 os.environ["HUGGINGFACE_HUB_CACHE"] = "./.cache"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-hf_logging.set_verbosity_error()
 warnings.filterwarnings("ignore")
 load_dotenv()
 
@@ -153,8 +149,9 @@ def _append_history(symbol: str, record: dict) -> None:
     if len(hist) > MEMORY_WINDOW:
         hist.pop(0)
 
-# ── Single model for all 3 roles — loads ONCE ──
+# ── Single model via HF Inference API — no GPU needed ──
 MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+HF_TOKEN = os.getenv("HF_TOKEN", "")   # set in Render env vars
 
 # =========================================================
 # LOGGER INITIALIZATION
@@ -203,39 +200,23 @@ class TradingLogger:
 log = TradingLogger(HISTORY_FILE)
 
 # =========================================================
-# GLOBAL MODEL LOADING
+# GLOBAL MODEL — HF Inference API (no GPU, no local weights)
 # =========================================================
 class ModelManager:
     def __init__(self):
-        self.model        = None
-        self.tokenizer    = None
-        self.gen_market   = None
-        self.gen_risk     = None
-        self.gen_decision = None
+        self.client = None
+        # Keep these names so the rest of the code is unchanged
+        self.gen_market   = "market"
+        self.gen_risk     = "risk"
+        self.gen_decision = "decision"
 
     def load(self):
-        print(f"\n--- Loading {MODEL_ID} (4-bit) via outlines ---")
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
+        print(f"\n--- Connecting to HF Inference API: {MODEL_ID} ---")
+        self.client = InferenceClient(
+            model=MODEL_ID,
+            token=HF_TOKEN,
         )
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            quantization_config=quant_config,
-            device_map="auto", # Fixed device map
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-        self.model = from_transformers(hf_model, self.tokenizer)
-
-        # Compile one FSM grammar per schema — one-time cost
-        self.gen_market   = Generator(self.model, output_type=MarketAnalysis)
-        self.gen_risk     = Generator(self.model, output_type=RiskAssessment)
-        self.gen_decision = Generator(self.model, output_type=TradeDecision)
-
-        vram = torch.cuda.memory_allocated() / 1e9
-        print(f"    Loaded | VRAM used: {vram:.1f}GB")
+        print("    HF Inference API ready — no GPU needed")
 
 print("=== Initializing AI Models ===")
 manager = ModelManager()
@@ -811,23 +792,36 @@ Write a 1-2 sentence reason."""
 # UTILS
 # =========================================================
 def call_structured(generator, schema_cls, system_prompt, user_content, max_new_tokens=300):
-    messages =[
-        {"role": "system", "content": system_prompt},
+    """Call HF Inference API and parse structured JSON response into Pydantic schema."""
+    schema_json = json.dumps(schema_cls.model_json_schema(), indent=2)
+    full_system = (
+        f"{system_prompt}\n\n"
+        f"You MUST respond with valid JSON only — no explanation, no markdown, no backticks.\n"
+        f"Your response must match this exact JSON schema:\n{schema_json}"
+    )
+    messages = [
+        {"role": "system", "content": full_system},
         {"role": "user",   "content": user_content},
     ]
-    prompt = manager.tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+    response = manager.client.chat.completions.create(
+        messages=messages,
+        max_tokens=max_new_tokens,
+        temperature=0.1,
     )
-    result = generator(prompt, max_new_tokens=max_new_tokens)
-    
-    # Fix: Safely handle incomplete or broken JSON outputs
-    if isinstance(result, str):
-        try:
-            result = schema_cls.model_validate_json(result)
-        except Exception as e:
-            log.err(f"LLM parsing failed: {e} | Fallback triggered.")
-            raise ValueError("Incomplete or malformed JSON output.")
-    return result
+    raw_text = response.choices[0].message.content.strip()
+
+    # Strip markdown fences if model adds them
+    if raw_text.startswith("```"):
+        raw_text = raw_text.split("```")[1]
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:]
+    raw_text = raw_text.strip()
+
+    try:
+        return schema_cls.model_validate_json(raw_text)
+    except Exception as e:
+        log.err(f"LLM parsing failed: {e} | raw: {raw_text[:200]}")
+        raise ValueError("Incomplete or malformed JSON output.")
 
 def normalize_date(val):
     return str(val).split("T")[0]
